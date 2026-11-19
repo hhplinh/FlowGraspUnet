@@ -14,6 +14,7 @@ import torch.optim as optim
 import torch.utils.data
 from torch.optim import AdamW
 from torchsummary import summary
+from tqdm import tqdm
 
 from diffusion.resample import create_named_schedule_sampler
 from diffusion.fp16_util import MixedPrecisionTrainer
@@ -117,9 +118,12 @@ def validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold):
     }
 
     ld = len(val_data)
+    is_main = int(os.environ.get('LOCAL_RANK', 0)) == 0
 
     with torch.no_grad():
-        for x, y, didx, rot, zoom_factor, prompt, query in val_data:
+        for x, y, didx, rot, zoom_factor, prompt, query in tqdm(
+            val_data, desc='Validating', leave=False, disable=not is_main
+        ):
             img = x.to(device)
             yc = [yy.to(device) for yy in y]
             pos_gt = yc[0]
@@ -204,6 +208,14 @@ def train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer
             diffusion.p_sample_loop
     )
 
+    is_main = int(os.environ.get('LOCAL_RANK', 0)) == 0
+    pbar = tqdm(
+        total=batches_per_epoch - 1,
+        desc=f'Epoch {epoch:02d}',
+        leave=False,
+        disable=not is_main,
+    )
+
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
     while batch_idx <= batches_per_epoch:
@@ -258,6 +270,11 @@ def train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            pbar.update(1)
+            pbar.set_postfix(loss=f'{loss.item():.4f}')
+
+    pbar.close()
 
     results['loss'] /= batch_idx
     for l in results['losses']:
