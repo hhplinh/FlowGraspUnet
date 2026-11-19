@@ -32,7 +32,7 @@ locket
 matplotlib
 munkres==1.1.4
 networkx
-numpy
+numpy==1.23.5
 omegaconf==2.3.0
 packaging
 partd
