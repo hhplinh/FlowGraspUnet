@@ -51,7 +51,7 @@ PyWavelets
 PyYAML
 regex==2023.8.8
 requests
-ruamel.yaml
+ruamel.yaml<0.18.0
 ruamel.yaml.clib
 sacremoses==0.0.53
 safetensors==0.3.3

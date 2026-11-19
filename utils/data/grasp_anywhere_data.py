@@ -39,7 +39,6 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
         else:
             with open(os.path.join('split/grasp-anything++/test/unseen.obj'), 'rb') as f:
                 idxs = pickle.load(f)
-
             self.grasp_files = list(filter(lambda x: x.split('/')[-1][:-5] in idxs, self.grasp_files))
 
 
@@ -131,11 +130,12 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
         obj_id = int(obj_id)
         part_id = int(part_id.split('.')[0])
 
-        with open(prompt_file, 'rb') as f:
-            x = pickle.load(f)
-            prompt, queries = x
-        
-        # with open(instruction_file, 'rb') as f:
-        #     instruction = pickle.load(f)
+        # with open(prompt_file, 'rb') as f:
+        #     x = pickle.load(f)
+        #     prompt, queries = x
 
-        return prompt, queries[obj_id]
+        # return prompt, queries[obj_id]
+        
+        with open(instruction_file, 'rb') as f:
+            instruction = pickle.load(f)
+        return instruction, instruction
