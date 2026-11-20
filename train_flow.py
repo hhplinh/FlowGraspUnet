@@ -2,12 +2,15 @@ import argparse
 import datetime
 import json
 import logging
+import math
 import os
 import numpy as np
 import tensorboardX
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from flow.rectified_flow import RectifiedGraspFlow
@@ -38,6 +41,7 @@ def parse_args():
     parser.add_argument("--ds-rotate", type=float, default=0.0)
     parser.add_argument("--max-samples", type=int, default=2000, help="0 for full dataset")
     parser.add_argument("--no-augment", action="store_true", default=False, help="Disable rotate/zoom")
+    parser.add_argument("--no-cache-sam3", action="store_true", default=False, help="Run SAM3 live every batch")
     parser.add_argument("--num-workers", type=int, default=4)
 
     # Training
@@ -57,6 +61,70 @@ def parse_args():
 
 
 @torch.no_grad()
+def build_sam3_cache(sam_grounder: Sam3Grounder, unaug_dataset, indices, batch_size: int, device):
+    """
+    Pre-computes (inst_mask, sem_mask, sam_vec) in float16 on CPU RAM for fast training.
+    """
+    subset = torch.utils.data.Subset(unaug_dataset, indices)
+    loader = torch.utils.data.DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    cache = {}
+    for x, _, didx, _, _, _, query in tqdm(loader, desc="Caching SAM 3 masks"):
+        inst_m, sem_m, sam_v = sam_grounder(x.to(device), query)
+        inst_cpu = inst_m.half().cpu()
+        sem_cpu = sem_m.half().cpu()
+        vec_cpu = sam_v.half().cpu()
+        for i, sample_idx in enumerate(didx.tolist()):
+            cache[int(sample_idx)] = (inst_cpu[i], sem_cpu[i], vec_cpu[i])
+    return cache
+
+
+def fetch_aligned_cached_sam(cache, didx, rot, zoom_factor, device):
+    """
+    Retrieves cached SAM 3 masks for a batch and applies exact GPU rotate/zoom
+    to stay aligned with augmented images and targets.
+    """
+    inst_list, sem_list, vec_list = [], [], []
+    for i, sample_idx in enumerate(didx.tolist()):
+        inst_m, sem_m, sam_v = cache[int(sample_idx)]
+        inst_m = inst_m.to(device=device, dtype=torch.float32)
+        sem_m = sem_m.to(device=device, dtype=torch.float32)
+        sam_v = sam_v.to(device=device, dtype=torch.float32)
+
+        r = float(rot[i].item())
+        z = float(zoom_factor[i].item())
+        _, H, W = inst_m.shape
+
+        if abs(r) > 1e-6:
+            angle_deg = r * 180.0 / math.pi
+            inst_m = TF.rotate(inst_m, angle=angle_deg, interpolation=TF.InterpolationMode.BILINEAR)
+            sem_m = TF.rotate(sem_m, angle=angle_deg, interpolation=TF.InterpolationMode.BILINEAR)
+
+        if abs(z - 1.0) > 1e-6:
+            sr = int(H * (1.0 - z)) // 2
+            sc = int(W * (1.0 - z)) // 2
+            if sr > 0 or sc > 0:
+                inst_m = F.interpolate(
+                    inst_m[:, sr : H - sr, sc : W - sc].unsqueeze(0),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                sem_m = F.interpolate(
+                    sem_m[:, sr : H - sr, sc : W - sc].unsqueeze(0),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
+        inst_list.append(inst_m)
+        sem_list.append(sem_m)
+        vec_list.append(sam_v)
+
+    return torch.stack(inst_list, dim=0), torch.stack(sem_list, dim=0), torch.stack(vec_list, dim=0)
+
+
+@torch.no_grad()
 def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, num_steps: int = 8):
     model.flow_net.eval()
     results = {"correct": 0, "failed": 0, "mask_hits": 0}
@@ -67,7 +135,6 @@ def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, 
             img, query, num_steps=num_steps, solver="euler", seed=42, return_masks=True
         )
 
-        # Measure SAM 3 grounding hit rate at ground-truth grasp center
         gt_pos = y[0].to(device)
         if gt_pos.ndim == 3:
             gt_pos = gt_pos.unsqueeze(1)
@@ -99,18 +166,22 @@ def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, 
     return results
 
 
-def train_one_epoch(epoch: int, model: RectifiedGraspFlow, device, train_data, optimizer):
+def train_one_epoch(epoch: int, model: RectifiedGraspFlow, device, train_data, optimizer, sam_cache=None):
     model.flow_net.train()
     total_loss = 0.0
     sub_losses = {}
     num_batches = 0
 
     pbar = tqdm(train_data, desc=f"Epoch {epoch:03d}", leave=False)
-    for x, y, _, _, _, prompt, query in pbar:
+    for x, y, didx, rot, zoom_factor, prompt, query in pbar:
         img = x.to(device, non_blocking=True)
         yc = [yy.to(device, non_blocking=True) for yy in y]
 
-        loss_dict = model.compute_loss(img, yc, query)
+        cached_sam = None
+        if sam_cache is not None:
+            cached_sam = fetch_aligned_cached_sam(sam_cache, didx, rot, zoom_factor, device)
+
+        loss_dict = model.compute_loss(img, yc, query, cached_sam=cached_sam)
         loss = loss_dict["loss"]
 
         optimizer.zero_grad(set_to_none=True)
@@ -214,13 +285,17 @@ def main():
     trainable_params = sum(p.numel() for p in flow_net.parameters() if p.requires_grad)
     logging.info(f"FlowGraspUNet trainable parameters: {trainable_params / 1e6:.2f}M")
 
-    # Persistent optimizer & cosine scheduler initialized ONCE outside the epoch loop
+    sam_cache = None
+    if not args.no_cache_sam3:
+        sam_cache = build_sam3_cache(sam_grounder, val_dataset, train_indices, args.batch_size, device)
+        logging.info(f"Cached SAM 3 features for {len(sam_cache)} training samples.")
+
     optimizer = AdamW(flow_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
     best_iou = -1.0
     for epoch in range(args.epochs):
-        train_res = train_one_epoch(epoch, model, device, train_data, optimizer)
+        train_res = train_one_epoch(epoch, model, device, train_data, optimizer, sam_cache=sam_cache)
         scheduler.step()
 
         tb.add_scalar("loss/train", train_res["loss"], epoch)

@@ -46,16 +46,21 @@ class FiLMResBlock(nn.Module):
 
 
 class SelfAttention2d(nn.Module):
-    """Lightweight spatial self-attention applied only at the 28x28 bottleneck."""
+    """Spatial self-attention with learnable 2D positional embeddings at the 28x28 bottleneck."""
 
-    def __init__(self, channels: int, num_heads: int = 4):
+    def __init__(self, channels: int, num_heads: int = 4, grid_size: int = 28):
         super().__init__()
         self.norm = nn.GroupNorm(8, channels)
+        self.pos_emb = nn.Parameter(torch.zeros(1, channels, grid_size, grid_size))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
         self.attn = nn.MultiheadAttention(channels, num_heads=num_heads, batch_first=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        h = self.norm(x).view(B, C, H * W).transpose(1, 2)  # (B, HW, C)
+        pos = self.pos_emb
+        if pos.shape[-2:] != (H, W):
+            pos = F.interpolate(pos, size=(H, W), mode="bilinear", align_corners=False)
+        h = (self.norm(x) + pos).view(B, C, H * W).transpose(1, 2)
         attn_out, _ = self.attn(h, h, h, need_weights=False)
         return x + attn_out.transpose(1, 2).view(B, C, H, W)
 
@@ -68,8 +73,8 @@ class FlowGraspUNet(nn.Module):
 
     def __init__(self, base_ch: int = 64, cond_dim: int = 256, sam_vec_dim: int = 16):
         super().__init__()
-        # Input channels: x_t (4) + img (3) + inst_mask (1) + sem_mask (1) + masked_img (3) = 12
-        in_channels = 12
+        # Input channels: x_t (4) + img (3) + inst_mask (1) + sem_mask (1) + masked_img (3) + coord (2) = 14
+        in_channels = 14
 
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(cond_dim),
@@ -97,7 +102,7 @@ class FlowGraspUNet(nn.Module):
 
         # Bottleneck at 28x28
         self.mid1 = FiLMResBlock(base_ch * 4, base_ch * 4, cond_dim)
-        self.mid_attn = SelfAttention2d(base_ch * 4, num_heads=4)
+        self.mid_attn = SelfAttention2d(base_ch * 4, num_heads=4, grid_size=28)
         self.mid2 = FiLMResBlock(base_ch * 4, base_ch * 4, cond_dim)
 
         # Decoder: 28 -> 56 -> 112 -> 224
@@ -117,25 +122,32 @@ class FlowGraspUNet(nn.Module):
         sem_mask: torch.Tensor,
         sam_vec: torch.Tensor,
     ) -> torch.Tensor:
+        B, _, H, W = x_t.shape
+        device = x_t.device
+        dtype = x_t.dtype
+
+        grid_y = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        grid_x = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+
         masked_img = img * inst_mask
-        inp = torch.cat([x_t, img, inst_mask, sem_mask, masked_img], dim=1)  # (B, 12, H, W)
-        cond = self.time_mlp(t) + self.sam_mlp(sam_vec)  # (B, cond_dim)
+        inp = torch.cat([x_t, img, inst_mask, sem_mask, masked_img, grid_x, grid_y], dim=1)
+        cond = self.time_mlp(t) + self.sam_mlp(sam_vec)
 
         h0 = self.in_conv(inp)
-        e1 = self.enc1(h0, cond)                          # (B, C, 224, 224)
-        e2 = self.enc2(self.down1(e1), cond)              # (B, 2C, 112, 112)
-        e3 = self.enc3(self.down2(e2), cond)              # (B, 4C, 56, 56)
+        e1 = self.enc1(h0, cond)
+        e2 = self.enc2(self.down1(e1), cond)
+        e3 = self.enc3(self.down2(e2), cond)
 
-        m = self.down3(e3)                                # (B, 4C, 28, 28)
+        m = self.down3(e3)
         m = self.mid2(self.mid_attn(self.mid1(m, cond)), cond)
 
         u3 = F.interpolate(m, size=e3.shape[-2:], mode="bilinear", align_corners=False)
-        d3 = self.dec3(torch.cat([u3, e3], dim=1), cond)  # (B, 4C, 56, 56)
+        d3 = self.dec3(torch.cat([u3, e3], dim=1), cond)
 
         u2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
-        d2 = self.dec2(torch.cat([u2, e2], dim=1), cond)  # (B, 2C, 112, 112)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1), cond)
 
         u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        d1 = self.dec1(torch.cat([u1, e1], dim=1), cond)  # (B, C, 224, 224)
+        d1 = self.dec1(torch.cat([u1, e1], dim=1), cond)
 
         return self.out_conv(F.silu(self.out_norm(d1)))

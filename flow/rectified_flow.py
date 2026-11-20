@@ -1,11 +1,12 @@
 from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class RectifiedGraspFlow(nn.Module):
     """
-    Mask-Prior Optimal Transport Conditional Flow Matching (OT-CFM) wrapper
+    Low-Variance Optimal Transport Conditional Flow Matching (OT-CFM) wrapper
     coupling Sam3Grounder (frozen) with FlowGraspUNet (trainable).
     """
 
@@ -13,37 +14,24 @@ class RectifiedGraspFlow(nn.Module):
         self,
         sam_grounder: nn.Module,
         flow_net: nn.Module,
-        prior_noise_std: float = 0.25,
-        mask_loss_weight: float = 4.0,
+        prior_std: float = 0.15,
+        fg_loss_weight: float = 15.0,
+        mask_loss_weight: float = 3.0,
+        dice_loss_weight: float = 0.5,
+        bg_suppression_weight: float = 1.0,
+        fg_pose_weight: float = 0.5,
         angle_norm_weight: float = 0.05,
     ):
         super().__init__()
         self.sam_grounder = sam_grounder
         self.flow_net = flow_net
-        self.prior_noise_std = prior_noise_std
+        self.prior_std = prior_std
+        self.fg_loss_weight = fg_loss_weight
         self.mask_loss_weight = mask_loss_weight
+        self.dice_loss_weight = dice_loss_weight
+        self.bg_suppression_weight = bg_suppression_weight
+        self.fg_pose_weight = fg_pose_weight
         self.angle_norm_weight = angle_norm_weight
-
-    def _sample_prior(
-        self,
-        inst_mask: torch.Tensor,
-        generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        """
-        Constructs mask-biased initial state x_0 of shape (B, 4, H, W):
-          channel 0 (pos): inst_mask + sigma * eps
-          channels 1..3 (cos, sin, width): sigma * eps
-        """
-        B, _, H, W = inst_mask.shape
-        eps = torch.randn(
-            (B, 4, H, W),
-            device=inst_mask.device,
-            dtype=inst_mask.dtype,
-            generator=generator,
-        )
-        prior_mean = torch.zeros_like(eps)
-        prior_mean[:, 0:1] = inst_mask
-        return prior_mean + self.prior_noise_std * eps
 
     @staticmethod
     def pack_targets(yc: List[torch.Tensor]) -> torch.Tensor:
@@ -51,33 +39,45 @@ class RectifiedGraspFlow(nn.Module):
         maps = [m.unsqueeze(1) if m.ndim == 3 else m for m in yc]
         return torch.cat(maps, dim=1)
 
+    @staticmethod
+    def _soft_dice_loss(pred_pos: torch.Tensor, target_pos: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        p = pred_pos.clamp(0.0, 1.0)
+        inter = (p * target_pos).sum(dim=(1, 2, 3))
+        denom = (p * p).sum(dim=(1, 2, 3)) + (target_pos * target_pos).sum(dim=(1, 2, 3)) + eps
+        return (1.0 - (2.0 * inter + eps) / denom).mean()
+
     def compute_loss(
         self,
         img: torch.Tensor,
         yc: List[torch.Tensor],
         queries,
+        cached_sam: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         x1 = self.pack_targets(yc)  # (B, 4, H, W)
-        B = x1.shape[0]
+        pos_gt = x1[:, 0:1]
+        B, _, H, W = x1.shape
         device = x1.device
 
-        # Stage 1: Frozen SAM 3 spatial grounding
-        inst_mask, sem_mask, sam_vec = self.sam_grounder(img, queries)
+        if cached_sam is not None:
+            inst_mask, sem_mask, sam_vec = cached_sam
+        else:
+            inst_mask, sem_mask, sam_vec = self.sam_grounder(img, queries)
 
-        # Stage 2: Sample prior x0 and continuous time t in [0, 1]
-        x0 = self._sample_prior(inst_mask)
+        # Low-variance Gaussian prior x0 ~ N(0, prior_std^2 I) prevents background noise spikes
+        x0 = self.prior_std * torch.randn((B, 4, H, W), device=device, dtype=x1.dtype)
         t = torch.rand((B,), device=device)
         t_view = t.view(B, 1, 1, 1)
 
-        # Straight OT interpolation and target velocity
         xt = (1.0 - t_view) * x0 + t_view * x1
         target_v = x1 - x0
 
-        # Stage 3: Predict velocity
         pred_v = self.flow_net(xt, t, img, inst_mask, sem_mask, sam_vec)
 
-        # Spatial attention weight: emphasizes target part while suppressing background
-        spatial_weight = 1.0 + self.mask_loss_weight * torch.maximum(inst_mask, sem_mask)
+        spatial_weight = (
+            1.0
+            + self.fg_loss_weight * pos_gt
+            + self.mask_loss_weight * torch.maximum(inst_mask, sem_mask)
+        )
 
         sq_err = (pred_v - target_v) ** 2
         loss_pos = (spatial_weight * sq_err[:, 0:1]).mean()
@@ -85,16 +85,31 @@ class RectifiedGraspFlow(nn.Module):
         loss_wid = (spatial_weight * sq_err[:, 3:4]).mean()
         loss_flow = loss_pos + loss_ang + loss_wid
 
-        # Unit-circle regularization on implied endpoint x1_hat = xt + (1 - t) * pred_v
+        # Implied clean endpoint x1_hat = xt + (1 - t) * pred_v
         x1_hat = xt + (1.0 - t_view) * pred_v
-        cos_hat, sin_hat = x1_hat[:, 1:2], x1_hat[:, 2:3]
-        target_region = (yc[0].unsqueeze(1) if yc[0].ndim == 3 else yc[0]) > 0.1
+        loss_dice = self._soft_dice_loss(x1_hat[:, 0:1], pos_gt)
+
+        # Suppress false positive peaks on background pixels
+        bg_mask = pos_gt <= 0.05
+        loss_bg = (x1_hat[:, 0:1][bg_mask] ** 2).mean() if bg_mask.any() else torch.tensor(0.0, device=device)
+
+        target_region = pos_gt > 0.1
         if target_region.any():
+            fg_mask = target_region.expand_as(x1[:, 1:4])
+            loss_fg_pose = F.smooth_l1_loss(x1_hat[:, 1:4][fg_mask], x1[:, 1:4][fg_mask])
+            cos_hat, sin_hat = x1_hat[:, 1:2], x1_hat[:, 2:3]
             loss_norm = ((cos_hat[target_region] ** 2 + sin_hat[target_region] ** 2 - 1.0) ** 2).mean()
         else:
+            loss_fg_pose = torch.tensor(0.0, device=device)
             loss_norm = torch.tensor(0.0, device=device)
 
-        total_loss = loss_flow + self.angle_norm_weight * loss_norm
+        total_loss = (
+            loss_flow
+            + self.dice_loss_weight * loss_dice
+            + self.bg_suppression_weight * loss_bg
+            + self.fg_pose_weight * loss_fg_pose
+            + self.angle_norm_weight * loss_norm
+        )
 
         return {
             "loss": total_loss,
@@ -102,6 +117,9 @@ class RectifiedGraspFlow(nn.Module):
                 "flow_pos": loss_pos.detach(),
                 "flow_ang": loss_ang.detach(),
                 "flow_wid": loss_wid.detach(),
+                "pos_dice": loss_dice.detach(),
+                "bg_supp": loss_bg.detach(),
+                "fg_pose": loss_fg_pose.detach(),
                 "ang_norm": loss_norm.detach(),
             },
         }
@@ -119,7 +137,7 @@ class RectifiedGraspFlow(nn.Module):
         """
         Zero-leakage ODE integration from t=0 to t=1 using ONLY (img, queries).
         """
-        B = img.shape[0]
+        B, _, H, W = img.shape
         device = img.device
 
         inst_mask, sem_mask, sam_vec = self.sam_grounder(img, queries)
@@ -128,7 +146,7 @@ class RectifiedGraspFlow(nn.Module):
         if seed is not None:
             gen = torch.Generator(device=device).manual_seed(seed)
 
-        x = self._sample_prior(inst_mask, generator=gen)
+        x = self.prior_std * torch.randn((B, 4, H, W), device=device, dtype=img.dtype, generator=gen)
         dt = 1.0 / num_steps
 
         for step in range(num_steps):
