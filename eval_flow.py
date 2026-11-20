@@ -22,7 +22,7 @@ def evaluate_checkpoint(model: RectifiedGraspFlow, loader, device, num_steps: in
 
     for x, y, didx, rot, zoom_factor, prompt, query in tqdm(loader, desc=f"Eval ({solver}, NFE={num_steps})"):
         img = x.to(device)
-        gtbbs = loader.dataset.get_gtbb(didx, rot, zoom_factor)
+        gtbbs = loader.dataset.get_gtbb(int(didx.item()), float(rot.item()), float(zoom_factor.item()))
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()

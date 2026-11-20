@@ -83,7 +83,7 @@ def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, 
         success = evaluation.calculate_iou_match(
             q_out,
             ang_out,
-            val_data.dataset.get_gtbb(didx, rot, zoom_factor),
+            val_data.dataset.get_gtbb(int(didx.item()), float(rot.item()), float(zoom_factor.item())),
             no_grasps=1,
             grasp_width=w_out,
             threshold=iou_threshold,
