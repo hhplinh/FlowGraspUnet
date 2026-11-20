@@ -88,6 +88,11 @@ def main():
     parser.add_argument("--solver", type=str, default="euler", choices=["euler", "midpoint"])
     parser.add_argument("--best-of-k", type=int, default=5)
     parser.add_argument("--iou-threshold", type=float, default=0.25)
+
+    parser.add_argument("--val-only", action="store_true", help="Evaluate only the held-out 10% validation split (seed=123)")
+    parser.add_argument("--split", type=float, default=0.9)
+    parser.add_argument("--random-seed", type=int, default=123)
+    parser.add_argument("--start-idx", type=int, default=0, help="Start index in dataset (e.g., 2000 for disjoint seen test)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -111,7 +116,18 @@ def main():
         add_file_path=args.add_file_path,
         max_samples=None if args.max_samples == 0 else args.max_samples,
     )
-    loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
+
+    indices = list(range(ds.length))
+    if args.val_only:
+        rng = np.random.RandomState(args.random_seed)
+        rng.shuffle(indices)
+        eval_indices = indices[int(np.floor(args.split * ds.length)):]
+    else:
+        eval_indices = indices[args.start_idx:]
+
+    eval_subset = torch.utils.data.Subset(ds, eval_indices)
+    loader = torch.utils.data.DataLoader(eval_subset, batch_size=1, shuffle=False, num_workers=2)
+    # loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
 
     split_name = "SEEN" if args.seen == 1 else "UNSEEN"
     print(f"\n=== Evaluating {args.checkpoint} on {split_name} ({ds.length} samples) ===")

@@ -117,6 +117,19 @@ def fetch_aligned_cached_sam(cache, didx, rot, zoom_factor, device):
                     align_corners=False,
                 ).squeeze(0)
 
+        if abs(r) > 1e-6 or abs(z - 1.0) > 1e-6:
+            gy = torch.linspace(-1.0, 1.0, H, device=device).view(1, H, 1)
+            gx = torch.linspace(-1.0, 1.0, W, device=device).view(1, 1, W)
+            mass = inst_m.sum() + 1e-6
+            cx = (inst_m * gx).sum() / mass
+            cy = (inst_m * gy).sum() / mass
+            sx = torch.sqrt(((inst_m * (gx - cx) ** 2).sum() / mass) + 1e-6)
+            sy = torch.sqrt(((inst_m * (gy - cy) ** 2).sum() / mass) + 1e-6)
+            sam_v = sam_v.clone()
+            sam_v[4:8] = 0.0
+            sam_v[8:12] = torch.stack([cx, cy, sx, sy])
+            sam_v[12:16] = torch.stack([inst_m.mean(), inst_m.amax(), sem_m.mean(), sem_m.amax()])
+
         inst_list.append(inst_m)
         sem_list.append(sem_m)
         vec_list.append(sam_v)
