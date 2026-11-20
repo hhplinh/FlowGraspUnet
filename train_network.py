@@ -81,6 +81,8 @@ def parse_args():
                         help='Flag for using seen classes, only work for Grasp-Anything dataset') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
+    parser.add_argument('--max-samples', type=int, default=100,
+                        help='Maximum number of dataset samples (0 for no limit)')
     
     args = parser.parse_args()
     return args
@@ -258,7 +260,8 @@ def run():
                       include_depth=args.use_depth,
                       include_rgb=args.use_rgb,
                       seen=args.seen,
-                      add_file_path=args.add_file_path)
+                      add_file_path=args.add_file_path,
+                      max_samples=None if args.max_samples == 0 else args.max_samples)
     logging.info('Dataset size is {}'.format(dataset.length))
 
     # Creating data indices for training and validation splits

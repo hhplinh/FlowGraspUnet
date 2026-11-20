@@ -14,7 +14,7 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
     Dataset wrapper for the Grasp-Anything dataset.
     """
 
-    def __init__(self, file_path, ds_rotate=0, **kwargs):
+    def __init__(self, file_path, ds_rotate=0, max_samples=None, **kwargs):
         """
         :param file_path: Grasp-Anything Dataset directory.
         :param ds_rotate: If splitting the dataset, rotate the list of items by this fraction first
@@ -46,6 +46,12 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
         self.prompt_files.sort()
         self.rgb_files.sort()
         self.mask_files.sort()
+
+        # self.length = len(self.grasp_files)
+        
+        # Cap dataset to N samples when requested
+        if max_samples is not None:
+            self.grasp_files = self.grasp_files[:max_samples]
 
         self.length = len(self.grasp_files)
 

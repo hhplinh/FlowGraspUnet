@@ -88,6 +88,8 @@ def parse_args():
                         help='Flag for using seen classes, only work for Grasp-Anything dataset') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
+    parser.add_argument('--max-samples', type=int, default=100,
+                        help='Maximum number of dataset samples (0 for no limit)')
     
     args = parser.parse_args()
     return args
@@ -332,7 +334,8 @@ def run():
                       include_depth=args.use_depth,
                       include_rgb=args.use_rgb,
                       seen=args.seen,
-                      add_file_path=args.add_file_path)
+                      add_file_path=args.add_file_path,
+                      max_samples=None if args.max_samples == 0 else args.max_samples)
     logging.info('Dataset size is {}'.format(dataset.length))
 
     # Creating data indices for training and validation splits
@@ -403,24 +406,25 @@ def run():
         tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
         for n, l in train_results['losses'].items():
             tb.add_scalar('train_loss/' + n, l, epoch)
+        
+        if (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
+            # Run Validation
+            logging.info('Validating...')
+            test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
+            logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
+                                        test_results['correct'] / (test_results['correct'] + test_results['failed'])))
 
-        # Run Validation
-        logging.info('Validating...')
-        test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
-        logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
-                                     test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+            # Log validation results to tensorbaord
+            tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
+            tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
+            for n, l in test_results['losses'].items():
+                tb.add_scalar('val_loss/' + n, l, epoch)
 
-        # Log validation results to tensorbaord
-        tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
-        tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
-        for n, l in test_results['losses'].items():
-            tb.add_scalar('val_loss/' + n, l, epoch)
-
-        # Save best performing network
-        iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
-        if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
-            torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
-            best_iou = iou
+            # Save best performing network
+            iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+            if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
+                torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
+                best_iou = iou
 
 
 if __name__ == '__main__':
