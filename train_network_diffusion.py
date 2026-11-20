@@ -72,6 +72,10 @@ def parse_args():
                         help='Batches per Epoch')
     parser.add_argument('--optim', type=str, default='adam',
                         help='Optmizer for the training. (adam or SGD)')
+    parser.add_argument('--max-samples', type=int, default=100,
+                        help='Maximum number of dataset samples (0 for no limit)')
+    parser.add_argument('--epochs_per_eval', type=int, default=10, help='Eval every n epochs')
+    
 
     # Logging etc.
     parser.add_argument('--description', type=str, default='',
@@ -88,9 +92,7 @@ def parse_args():
                         help='Flag for using seen classes, only work for Grasp-Anything dataset') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
-    parser.add_argument('--max-samples', type=int, default=100,
-                        help='Maximum number of dataset samples (0 for no limit)')
-    
+
     args = parser.parse_args()
     return args
 
@@ -407,7 +409,7 @@ def run():
         for n, l in train_results['losses'].items():
             tb.add_scalar('train_loss/' + n, l, epoch)
         
-        if (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
+        if (epoch + 1) % args.epochs_per_eval == 0 or epoch == args.epochs - 1:
             # Run Validation
             logging.info('Validating...')
             test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
