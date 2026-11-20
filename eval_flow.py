@@ -95,7 +95,7 @@ def main():
     base_ch = ckpt.get("base_ch", 64)
 
     sam_grounder = Sam3Grounder(model_path=args.sam3_path, device=device)
-    flow_net = FlowGraspUNet(base_ch=base_ch).to(device)
+    flow_net = FlowGraspUNet(base_ch=base_ch, sam_vec_dim=ckpt.get("sam_vec_dim", sam_grounder.sam_vec_dim)).to(device)
     flow_net.load_state_dict(ckpt["model_state_dict"])
     model = RectifiedGraspFlow(sam_grounder, flow_net).to(device)
 

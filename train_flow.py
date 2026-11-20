@@ -279,7 +279,7 @@ def main():
 
     logging.info("Loading frozen SAM 3 and initializing FlowGraspUNet...")
     sam_grounder = Sam3Grounder(model_path=args.sam3_path, device=device)
-    flow_net = FlowGraspUNet(base_ch=args.base_ch).to(device)
+    flow_net = FlowGraspUNet(base_ch=args.base_ch, sam_vec_dim=sam_grounder.sam_vec_dim).to(device)
     model = RectifiedGraspFlow(sam_grounder, flow_net).to(device)
 
     trainable_params = sum(p.numel() for p in flow_net.parameters() if p.requires_grad)
@@ -331,6 +331,7 @@ def main():
                         "epoch": epoch,
                         "iou": best_iou,
                         "base_ch": args.base_ch,
+                        "sam_vec_dim": sam_grounder.sam_vec_dim,
                         "model_state_dict": flow_net.state_dict(),
                         "args": vars(args),
                     },
