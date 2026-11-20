@@ -300,7 +300,9 @@ def main():
 
     sam_cache = None
     if not args.no_cache_sam3:
-        sam_cache = build_sam3_cache(sam_grounder, val_dataset, train_indices, args.batch_size, device)
+        sam_cache = build_sam3_cache(sam_grounder, val_dataset, train_indices, min(args.batch_size, 8), device)
+        sam_grounder.cpu()
+        torch.cuda.empty_cache()
         logging.info(f"Cached SAM 3 features for {len(sam_cache)} training samples.")
 
     optimizer = AdamW(flow_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -316,7 +318,11 @@ def main():
             tb.add_scalar(f"train/{k}", v, epoch)
 
         if (epoch + 1) % args.epochs_per_eval == 0 or epoch == args.epochs - 1 or epoch == 0:
+            sam_grounder.to(device)
             val_res = validate(model, device, val_data, args.iou_threshold, num_steps=args.num_steps)
+            if sam_cache is not None:
+                sam_grounder.cpu()
+                torch.cuda.empty_cache()
             logging.info(
                 f"Epoch {epoch:03d} | Train Loss: {train_res['loss']:.4f} | "
                 f"Val IoU@{args.iou_threshold}: {val_res['correct']}/{val_res['correct'] + val_res['failed']} = {val_res['iou']:.4f} | "

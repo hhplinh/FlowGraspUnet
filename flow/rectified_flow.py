@@ -71,7 +71,10 @@ class RectifiedGraspFlow(nn.Module):
         xt = (1.0 - t_view) * x0 + t_view * x1
         target_v = x1 - x0
 
-        pred_v = self.flow_net(xt, t, img, inst_mask, sem_mask, sam_vec)
+        # pred_v = self.flow_net(xt, t, img, inst_mask, sem_mask, sam_vec)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=img.is_cuda):
+            pred_v = self.flow_net(xt, t, img, inst_mask, sem_mask, sam_vec)
+        pred_v = pred_v.float()
 
         spatial_weight = (
             1.0
