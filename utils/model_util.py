@@ -3,8 +3,10 @@ from diffusion.respace import SpacedDiffusion, space_timesteps
 
 from utils.fixseed import fixseed
 
-def create_diffusion():
-    diffusion = create_gaussian_diffusion(get_default_diffusion())
+def create_diffusion(timestep_respacing=''):
+    args = get_default_diffusion()
+    args['timestep_respacing'] = timestep_respacing
+    diffusion = create_gaussian_diffusion(args)
     return diffusion
 
 
@@ -60,7 +62,8 @@ def create_gaussian_diffusion(args):
     predict_xstart = True  # we always predict x_start (a.k.a. x0), that's our deal!
     steps = 1000
     scale_beta = 1.  # no scaling
-    timestep_respacing = ''  # can be used for ddim sampling, we don't use it.
+    # timestep_respacing = ''  # can be used for ddim sampling, we don't use it.
+    timestep_respacing = args.get('timestep_respacing', '')
     learn_sigma = False
     rescale_timesteps = False
 

@@ -602,7 +602,12 @@ class GaussianDiffusion:
         self,
         model,
         x,
+        gt,
         t,
+        img,
+        text,
+        alpha,
+        idx,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -618,6 +623,10 @@ class GaussianDiffusion:
             model,
             x,
             t,
+            img,
+            text,
+            alpha,
+            idx,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
@@ -690,6 +699,11 @@ class GaussianDiffusion:
         self,
         model,
         shape,
+        gt,
+        img,
+        text,
+        alpha,
+        idx,
         noise=None,
         clip_denoised=True,
         denoised_fn=None,
@@ -707,7 +721,12 @@ class GaussianDiffusion:
         final = None
         for sample in self.ddim_sample_loop_progressive(
             model,
+            gt,
             shape,
+            img,
+            text,
+            alpha,
+            idx,
             noise=noise,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
@@ -723,7 +742,12 @@ class GaussianDiffusion:
     def ddim_sample_loop_progressive(
         self,
         model,
+        gt,
         shape,
+        image,
+        text,
+        alpha,
+        idx,
         noise=None,
         clip_denoised=True,
         denoised_fn=None,
@@ -760,7 +784,72 @@ class GaussianDiffusion:
                 out = self.ddim_sample(
                     model,
                     img,
+                    gt,
                     t,
+                    image,
+                    text,
+                    alpha,
+                    idx,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                    eta=eta,
+                )
+                yield out
+                img = out["sample"]
+
+    def ddim_sample_loop_progressive(
+        self,
+        model,
+        gt,
+        shape,
+        image,
+        text,
+        alpha,
+        idx,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+    ):
+        """
+        Use DDIM to sample from the model and yield intermediate samples from
+        each timestep of DDIM.
+
+        Same usage as p_sample_loop_progressive().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                out = self.ddim_sample(
+                    model,
+                    img,
+                    gt,
+                    t,
+                    image,
+                    text,
+                    alpha,
+                    idx,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,

@@ -109,7 +109,7 @@ def validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold):
     net.eval()
 
     sample_fn = (
-            diffusion.p_sample_loop
+            diffusion.ddim_sample_loop
     )
 
     results = {
@@ -373,6 +373,7 @@ def run():
     input_channels = 1 * args.use_depth + 3 * args.use_rgb
     network = get_network(args.network)
     diffusion = create_diffusion()
+    val_diffusion = create_diffusion(timestep_respacing='ddim50')
     schedule_sampler = create_named_schedule_sampler('uniform', diffusion)
     net = network(
         input_channels=input_channels,
@@ -412,7 +413,7 @@ def run():
         if (epoch + 1) % args.epochs_per_eval == 0 or epoch == args.epochs - 1:
             # Run Validation
             logging.info('Validating...')
-            test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
+            test_results = validate(net, val_diffusion, schedule_sampler, device, val_data, args.iou_threshold)
             logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
                                         test_results['correct'] / (test_results['correct'] + test_results['failed'])))
 
