@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--max-samples", type=int, default=2000, help="0 for full dataset")
     parser.add_argument("--no-augment", action="store_true", default=False, help="Disable rotate/zoom")
     parser.add_argument("--no-cache-sam3", action="store_true", default=False, help="Run SAM3 live every batch")
+    parser.add_argument("--sam3-cache-dir", type=str, default="data/sam3_cache", help="Local directory for .npy SAM3 cache")
     parser.add_argument("--num-workers", type=int, default=4)
 
     # Training
@@ -64,24 +65,56 @@ def parse_args():
 
     return parser.parse_args()
 
-
-@torch.no_grad()
-def build_sam3_cache(sam_grounder: Sam3Grounder, unaug_dataset, indices, batch_size: int, device):
+class PerIndexSamCache:
     """
-    Pre-computes (inst_mask, sem_mask, sam_vec) in float16 on CPU RAM for fast training.
+    Saves each sample index to its own file (<cache_dir>/<idx:06d>.pt)
+    and loads directly by sample_idx on demand.
     """
-    subset = torch.utils.data.Subset(unaug_dataset, indices)
-    loader = torch.utils.data.DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=4)
 
-    cache = {}
-    for x, _, didx, _, _, _, query in tqdm(loader, desc="Caching SAM 3 masks"):
-        inst_m, sem_m, sam_v = sam_grounder(x.to(device), query)
-        inst_cpu = inst_m.half().cpu()
-        sem_cpu = sem_m.half().cpu()
-        vec_cpu = sam_v.half().cpu()
-        for i, sample_idx in enumerate(didx.tolist()):
-            cache[int(sample_idx)] = (inst_cpu[i], sem_cpu[i], vec_cpu[i])
-    return cache
+    def __init__(self, cache_dir: str, unaug_dataset, indices, sam3_path: str, batch_size: int, device):
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        missing = [int(i) for i in indices if not os.path.exists(self._file_path(i))]
+        if missing:
+            self._populate(missing, unaug_dataset, sam3_path, batch_size, device)
+
+        sample_file = self._file_path(indices[0])
+        _, _, sample_vec = torch.load(sample_file, map_location="cpu", weights_only=True)
+        self.sam_vec_dim = int(sample_vec.shape[0])
+        self.num_cached = len(indices)
+
+    def _file_path(self, sample_idx: int) -> str:
+        return os.path.join(self.cache_dir, f"{int(sample_idx):06d}.pt")
+
+    @torch.no_grad()
+    def _populate(self, missing_indices, unaug_dataset, sam3_path: str, batch_size: int, device):
+        logging.info(f"Computing SAM 3 features for {len(missing_indices)} uncached samples...")
+        sam_grounder = Sam3Grounder(model_path=sam3_path, device=device)
+
+        subset = torch.utils.data.Subset(unaug_dataset, missing_indices)
+        loader = torch.utils.data.DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+        for x, _, didx, _, _, _, query in tqdm(loader, desc="Saving per-index SAM 3 files"):
+            inst_m, sem_m, sam_v = sam_grounder(x.to(device), query)
+            inst_cpu = inst_m.half().cpu()
+            sem_cpu = sem_m.half().cpu()
+            vec_cpu = sam_v.half().cpu()
+            for i, sample_idx in enumerate(didx.tolist()):
+                final_path = self._file_path(sample_idx)
+                tmp_path = f"{final_path}.tmp"
+                torch.save((inst_cpu[i].clone(), sem_cpu[i].clone(), vec_cpu[i].clone()), tmp_path)
+                os.replace(tmp_path, final_path)
+
+        del sam_grounder
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def __len__(self):
+        return self.num_cached
+
+    def __getitem__(self, sample_idx: int):
+        return torch.load(self._file_path(sample_idx), map_location="cpu", weights_only=True)
 
 
 def fetch_aligned_cached_sam(cache, didx, rot, zoom_factor, device):
@@ -95,6 +128,8 @@ def fetch_aligned_cached_sam(cache, didx, rot, zoom_factor, device):
         inst_m = inst_m.to(device=device, dtype=torch.float32)
         sem_m = sem_m.to(device=device, dtype=torch.float32)
         sam_v = sam_v.to(device=device, dtype=torch.float32)
+        sam_v = sam_v.clone()
+        sam_v[4:8] = 0.0
 
         r = float(rot[i].item())
         z = float(zoom_factor[i].item())
@@ -327,26 +362,31 @@ def main():
         num_workers=args.num_workers,
     )
 
-    logging.info("Loading frozen SAM 3 and initializing FlowGraspUNet...")
-    sam_grounder = Sam3Grounder(model_path=args.sam3_path, device=device)
-    sam_vec_dim = sam_grounder.sam_vec_dim
+    sam_cache = None
+    sam_grounder = None
+    if not args.no_cache_sam3:
+        cache_subdir = os.path.join(args.sam3_cache_dir, f"seen{args.seen}_sz{args.input_size}")
+        sam_cache = PerIndexSamCache(
+            cache_dir=cache_subdir,
+            unaug_dataset=val_dataset,
+            indices=train_indices + val_indices,
+            sam3_path=args.sam3_path,
+            batch_size=min(args.batch_size, 8),
+            device=device,
+        )
+        sam_vec_dim = sam_cache.sam_vec_dim
+        logging.info(f"Ready with per-index SAM 3 cache ({len(sam_cache)} files) at {cache_subdir}")
+    else:
+        logging.info("Loading frozen SAM 3 (live mode)...")
+        sam_grounder = Sam3Grounder(model_path=args.sam3_path, device=device)
+        sam_vec_dim = sam_grounder.sam_vec_dim
+
     flow_net = FlowGraspUNet(base_ch=args.base_ch, sam_vec_dim=sam_vec_dim).to(device)
     ema_net = copy.deepcopy(flow_net).eval()
     model = RectifiedGraspFlow(sam_grounder, flow_net).to(device)
 
     trainable_params = sum(p.numel() for p in flow_net.parameters() if p.requires_grad)
     logging.info(f"FlowGraspUNet trainable parameters: {trainable_params / 1e6:.2f}M")
-
-    sam_cache = None
-    if not args.no_cache_sam3:
-        sam_cache = build_sam3_cache(
-            sam_grounder, val_dataset, train_indices + val_indices, min(args.batch_size, 8), device
-        )
-        model.sam_grounder = None
-        del sam_grounder
-        gc.collect()
-        torch.cuda.empty_cache()
-        logging.info(f"Cached SAM 3 features for {len(sam_cache)} samples (train + val) on CPU and freed SAM 3 VRAM.")
 
     optimizer = AdamW(flow_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     warmup_epochs = min(args.warmup_epochs, max(args.epochs // 10, 1))
