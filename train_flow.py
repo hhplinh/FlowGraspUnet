@@ -138,14 +138,22 @@ def fetch_aligned_cached_sam(cache, didx, rot, zoom_factor, device):
 
 
 @torch.no_grad()
-def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, num_steps: int = 8):
+def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, num_steps: int = 8, sam_cache=None):
     model.flow_net.eval()
     results = {"correct": 0, "failed": 0, "mask_hits": 0}
 
     for x, y, didx, rot, zoom_factor, prompt, query in tqdm(val_data, desc="Validating", leave=False):
         img = x.to(device)
+        cached_sam = None
+        if sam_cache is not None:
+            inst_m, sem_m, sam_v = sam_cache[int(didx.item())]
+            cached_sam = (
+                inst_m.unsqueeze(0).to(device=device, dtype=torch.float32),
+                sem_m.unsqueeze(0).to(device=device, dtype=torch.float32),
+                sam_v.unsqueeze(0).to(device=device, dtype=torch.float32),
+            )
         pred, (inst_mask, sem_mask) = model.sample_ode(
-            img, query, num_steps=num_steps, solver="euler", seed=42, return_masks=True
+            img, query, num_steps=num_steps, solver="euler", seed=42, return_masks=True, cached_sam=cached_sam
         )
 
         gt_pos = y[0].to(device)
@@ -300,10 +308,12 @@ def main():
 
     sam_cache = None
     if not args.no_cache_sam3:
-        sam_cache = build_sam3_cache(sam_grounder, val_dataset, train_indices, min(args.batch_size, 8), device)
+        sam_cache = build_sam3_cache(
+            sam_grounder, val_dataset, train_indices + val_indices, min(args.batch_size, 8), device
+        )
         sam_grounder.cpu()
         torch.cuda.empty_cache()
-        logging.info(f"Cached SAM 3 features for {len(sam_cache)} training samples.")
+        logging.info(f"Cached SAM 3 features for {len(sam_cache)} samples (train + val) on CPU.")
 
     optimizer = AdamW(flow_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -318,11 +328,8 @@ def main():
             tb.add_scalar(f"train/{k}", v, epoch)
 
         if (epoch + 1) % args.epochs_per_eval == 0 or epoch == args.epochs - 1 or epoch == 0:
-            sam_grounder.to(device)
-            val_res = validate(model, device, val_data, args.iou_threshold, num_steps=args.num_steps)
-            if sam_cache is not None:
-                sam_grounder.cpu()
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+            val_res = validate(model, device, val_data, args.iou_threshold, num_steps=args.num_steps, sam_cache=sam_cache)
             logging.info(
                 f"Epoch {epoch:03d} | Train Loss: {train_res['loss']:.4f} | "
                 f"Val IoU@{args.iou_threshold}: {val_res['correct']}/{val_res['correct'] + val_res['failed']} = {val_res['iou']:.4f} | "
@@ -338,7 +345,9 @@ def main():
                     sampler=torch.utils.data.SubsetRandomSampler(train_indices),
                     num_workers=args.num_workers,
                 )
-                tr_eval = validate(model, device, train_eval_loader, args.iou_threshold, num_steps=args.num_steps)
+                tr_eval = validate(
+                    model, device, train_eval_loader, args.iou_threshold, num_steps=args.num_steps, sam_cache=sam_cache
+                )
                 logging.info(f"Epoch {epoch:03d} | Train Set IoU@{args.iou_threshold}: {tr_eval['iou']:.4f}")
                 tb.add_scalar("train/iou", tr_eval["iou"], epoch)
 

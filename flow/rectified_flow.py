@@ -136,6 +136,7 @@ class RectifiedGraspFlow(nn.Module):
         solver: str = "euler",
         seed: Optional[int] = 42,
         return_masks: bool = False,
+        cached_sam: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Zero-leakage ODE integration from t=0 to t=1 using ONLY (img, queries).
@@ -143,7 +144,10 @@ class RectifiedGraspFlow(nn.Module):
         B, _, H, W = img.shape
         device = img.device
 
-        inst_mask, sem_mask, sam_vec = self.sam_grounder(img, queries)
+        if cached_sam is not None:
+            inst_mask, sem_mask, sam_vec = cached_sam
+        else:
+            inst_mask, sem_mask, sam_vec = self.sam_grounder(img, queries)
 
         gen = None
         if seed is not None:
