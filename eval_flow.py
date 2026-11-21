@@ -1,5 +1,6 @@
 import argparse
 import time
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -14,6 +15,7 @@ from utils.dataset_processing import evaluation
 @torch.no_grad()
 def evaluate_checkpoint(model: RectifiedGraspFlow, loader, device, num_steps: int, solver: str, best_of_k: int, iou_threshold: float):
     model.flow_net.eval()
+    base_ds = loader.dataset.dataset if isinstance(loader.dataset, torch.utils.data.Subset) else loader.dataset
     top1_correct = 0
     bestk_correct = 0
     mask_hits = 0
@@ -22,7 +24,7 @@ def evaluate_checkpoint(model: RectifiedGraspFlow, loader, device, num_steps: in
 
     for x, y, didx, rot, zoom_factor, prompt, query in tqdm(loader, desc=f"Eval ({solver}, NFE={num_steps})"):
         img = x.to(device)
-        gtbbs = loader.dataset.get_gtbb(int(didx.item()), float(rot.item()), float(zoom_factor.item()))
+        gtbbs = base_ds.get_gtbb(int(didx.item()), float(rot.item()), float(zoom_factor.item()))
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -130,7 +132,7 @@ def main():
     # loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
 
     split_name = "SEEN" if args.seen == 1 else "UNSEEN"
-    print(f"\n=== Evaluating {args.checkpoint} on {split_name} ({ds.length} samples) ===")
+    print(f"\n=== Evaluating {args.checkpoint} on {split_name} ({len(eval_indices)} samples) ===")
     for steps in args.steps_list:
         res = evaluate_checkpoint(model, loader, device, steps, args.solver, args.best_of_k, args.iou_threshold)
         print(

@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import gc
 import json
 import logging
 import math
@@ -45,7 +46,8 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
 
     # Training
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (16 * 2 = 32 effective bs)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -186,15 +188,18 @@ def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, 
     results["mask_hit_rate"] = results["mask_hits"] / total
     return results
 
-
-def train_one_epoch(epoch: int, model: RectifiedGraspFlow, device, train_data, optimizer, sam_cache=None):
+def train_one_epoch(
+    epoch: int, model: RectifiedGraspFlow, device, train_data, optimizer, sam_cache=None, grad_accum: int = 1
+):
     model.flow_net.train()
     total_loss = 0.0
     sub_losses = {}
     num_batches = 0
+    total_batches = len(train_data)
+    optimizer.zero_grad(set_to_none=True)
 
     pbar = tqdm(train_data, desc=f"Epoch {epoch:03d}", leave=False)
-    for x, y, didx, rot, zoom_factor, prompt, query in pbar:
+    for step_idx, (x, y, didx, rot, zoom_factor, prompt, query) in enumerate(pbar):
         img = x.to(device, non_blocking=True)
         yc = [yy.to(device, non_blocking=True) for yy in y]
 
@@ -205,10 +210,14 @@ def train_one_epoch(epoch: int, model: RectifiedGraspFlow, device, train_data, o
         loss_dict = model.compute_loss(img, yc, query, cached_sam=cached_sam)
         loss = loss_dict["loss"]
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.flow_net.parameters(), max_norm=1.0)
-        optimizer.step()
+        rem = total_batches % grad_accum
+        window = rem if (rem != 0 and step_idx >= total_batches - rem) else grad_accum
+        (loss / window).backward()
+
+        if (step_idx + 1) % grad_accum == 0 or (step_idx + 1) == total_batches:
+            torch.nn.utils.clip_grad_norm_(model.flow_net.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item()
         for k, v in loss_dict["losses"].items():
@@ -300,7 +309,8 @@ def main():
 
     logging.info("Loading frozen SAM 3 and initializing FlowGraspUNet...")
     sam_grounder = Sam3Grounder(model_path=args.sam3_path, device=device)
-    flow_net = FlowGraspUNet(base_ch=args.base_ch, sam_vec_dim=sam_grounder.sam_vec_dim).to(device)
+    sam_vec_dim = sam_grounder.sam_vec_dim
+    flow_net = FlowGraspUNet(base_ch=args.base_ch, sam_vec_dim=sam_vec_dim).to(device)
     model = RectifiedGraspFlow(sam_grounder, flow_net).to(device)
 
     trainable_params = sum(p.numel() for p in flow_net.parameters() if p.requires_grad)
@@ -311,16 +321,20 @@ def main():
         sam_cache = build_sam3_cache(
             sam_grounder, val_dataset, train_indices + val_indices, min(args.batch_size, 8), device
         )
-        sam_grounder.cpu()
+        model.sam_grounder = None
+        del sam_grounder
+        gc.collect()
         torch.cuda.empty_cache()
-        logging.info(f"Cached SAM 3 features for {len(sam_cache)} samples (train + val) on CPU.")
+        logging.info(f"Cached SAM 3 features for {len(sam_cache)} samples (train + val) on CPU and freed SAM 3 VRAM.")
 
     optimizer = AdamW(flow_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
     best_iou = -1.0
     for epoch in range(args.epochs):
-        train_res = train_one_epoch(epoch, model, device, train_data, optimizer, sam_cache=sam_cache)
+        train_res = train_one_epoch(
+            epoch, model, device, train_data, optimizer, sam_cache=sam_cache, grad_accum=args.grad_accum
+        )
         scheduler.step()
 
         tb.add_scalar("loss/train", train_res["loss"], epoch)
@@ -359,7 +373,7 @@ def main():
                         "epoch": epoch,
                         "iou": best_iou,
                         "base_ch": args.base_ch,
-                        "sam_vec_dim": sam_grounder.sam_vec_dim,
+                        "sam_vec_dim": sam_vec_dim,
                         "model_state_dict": flow_net.state_dict(),
                         "args": vars(args),
                     },
