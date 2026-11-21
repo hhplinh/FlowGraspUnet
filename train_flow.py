@@ -1,4 +1,5 @@
 import argparse
+import copy
 import datetime
 import gc
 import json
@@ -10,8 +11,9 @@ import tensorboardX
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torchvision.transforms.functional as TF
+
 from tqdm import tqdm
 
 from flow.rectified_flow import RectifiedGraspFlow
@@ -29,7 +31,7 @@ def parse_args():
     parser.add_argument("--sam3-path", type=str, default="/workspace/models/sam3")
     parser.add_argument("--base-ch", type=int, default=64, help="Base channel width of FlowGraspUNet")
     parser.add_argument("--input-size", type=int, default=224)
-    parser.add_argument("--num-steps", type=int, default=8, help="Euler ODE steps for validation")
+    parser.add_argument("--num-steps", type=int, default=100, help="Euler ODE steps for validation")
     parser.add_argument("--iou-threshold", type=float, default=0.25)
 
     # Dataset
@@ -48,8 +50,9 @@ def parse_args():
     # Training
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (16 * 2 = 32 effective bs)")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--warmup-epochs", type=int, default=15)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--epochs-per-eval", type=int, default=10)
     parser.add_argument("--eval-train", action="store_true", default=False, help="Also measure train IoU")
@@ -189,13 +192,23 @@ def validate(model: RectifiedGraspFlow, device, val_data, iou_threshold: float, 
     return results
 
 def train_one_epoch(
-    epoch: int, model: RectifiedGraspFlow, device, train_data, optimizer, sam_cache=None, grad_accum: int = 1
+    epoch: int,
+    model: RectifiedGraspFlow,
+    device,
+    train_data,
+    optimizer,
+    sam_cache=None,
+    grad_accum: int = 1,
+    ema_net=None,
+    ema_decay: float = 0.9995,
+    opt_step: int = 0,
 ):
     model.flow_net.train()
     total_loss = 0.0
     sub_losses = {}
     num_batches = 0
     total_batches = len(train_data)
+    cur_lr = optimizer.param_groups[0]["lr"]
     optimizer.zero_grad(set_to_none=True)
 
     pbar = tqdm(train_data, desc=f"Epoch {epoch:03d}", leave=False)
@@ -218,17 +231,24 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.flow_net.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            opt_step += 1
+            if ema_net is not None:
+                d = min(ema_decay, (1.0 + opt_step) / (10.0 + opt_step))
+                with torch.no_grad():
+                    for ep, p in zip(ema_net.parameters(), model.flow_net.parameters()):
+                        ep.mul_(d).add_(p, alpha=1.0 - d)
 
         total_loss += loss.item()
         for k, v in loss_dict["losses"].items():
             sub_losses[k] = sub_losses.get(k, 0.0) + v.item()
         num_batches += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{cur_lr:.2e}")
 
     denom = max(num_batches, 1)
     return {
         "loss": total_loss / denom,
         "losses": {k: v / denom for k, v in sub_losses.items()},
+        "opt_step": opt_step,
     }
 
 
@@ -311,6 +331,7 @@ def main():
     sam_grounder = Sam3Grounder(model_path=args.sam3_path, device=device)
     sam_vec_dim = sam_grounder.sam_vec_dim
     flow_net = FlowGraspUNet(base_ch=args.base_ch, sam_vec_dim=sam_vec_dim).to(device)
+    ema_net = copy.deepcopy(flow_net).eval()
     model = RectifiedGraspFlow(sam_grounder, flow_net).to(device)
 
     trainable_params = sum(p.numel() for p in flow_net.parameters() if p.requires_grad)
@@ -328,29 +349,64 @@ def main():
         logging.info(f"Cached SAM 3 features for {len(sam_cache)} samples (train + val) on CPU and freed SAM 3 VRAM.")
 
     optimizer = AdamW(flow_net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    warmup_epochs = min(args.warmup_epochs, max(args.epochs // 10, 1))
+    warmup_sched = LinearLR(optimizer, start_factor=0.05, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=max(args.epochs - warmup_epochs, 1), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
+    eval_history_path = os.path.join(save_folder, "eval_history.jsonl")
 
     best_iou = -1.0
+    opt_step = 0
     for epoch in range(args.epochs):
+        cur_lr = optimizer.param_groups[0]["lr"]
         train_res = train_one_epoch(
-            epoch, model, device, train_data, optimizer, sam_cache=sam_cache, grad_accum=args.grad_accum
+            epoch,
+            model,
+            device,
+            train_data,
+            optimizer,
+            sam_cache=sam_cache,
+            grad_accum=args.grad_accum,
+            ema_net=ema_net,
+            opt_step=opt_step,
         )
+        opt_step = train_res["opt_step"]
         scheduler.step()
 
+        logging.info(f"Epoch {epoch:03d} | LR: {cur_lr:.2e} | Train Loss: {train_res['loss']:.4f}")
         tb.add_scalar("loss/train", train_res["loss"], epoch)
+        tb.add_scalar("train/lr", cur_lr, epoch)
         for k, v in train_res["losses"].items():
             tb.add_scalar(f"train/{k}", v, epoch)
 
         if (epoch + 1) % args.epochs_per_eval == 0 or epoch == args.epochs - 1 or epoch == 0:
             torch.cuda.empty_cache()
+            model.flow_net = ema_net
             val_res = validate(model, device, val_data, args.iou_threshold, num_steps=args.num_steps, sam_cache=sam_cache)
             logging.info(
-                f"Epoch {epoch:03d} | Train Loss: {train_res['loss']:.4f} | "
+                f"Epoch {epoch:03d} [EVAL] | LR: {cur_lr:.2e} | Train Loss: {train_res['loss']:.4f} | "
                 f"Val IoU@{args.iou_threshold}: {val_res['correct']}/{val_res['correct'] + val_res['failed']} = {val_res['iou']:.4f} | "
                 f"SAM3 Mask Hit: {val_res['mask_hit_rate']:.4f}"
             )
             tb.add_scalar("val/iou", val_res["iou"], epoch)
             tb.add_scalar("val/mask_hit_rate", val_res["mask_hit_rate"], epoch)
+            tb.add_scalar("val/lr", cur_lr, epoch)
+
+            with open(eval_history_path, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "epoch": epoch,
+                            "lr": cur_lr,
+                            "train_loss": round(train_res["loss"], 6),
+                            "val_iou": round(val_res["iou"], 6),
+                            "correct": val_res["correct"],
+                            "total": val_res["correct"] + val_res["failed"],
+                            "mask_hit_rate": round(val_res["mask_hit_rate"], 6),
+                        }
+                    )
+                    + "\n"
+                )
 
             if args.eval_train:
                 train_eval_loader = torch.utils.data.DataLoader(
@@ -362,8 +418,10 @@ def main():
                 tr_eval = validate(
                     model, device, train_eval_loader, args.iou_threshold, num_steps=args.num_steps, sam_cache=sam_cache
                 )
-                logging.info(f"Epoch {epoch:03d} | Train Set IoU@{args.iou_threshold}: {tr_eval['iou']:.4f}")
+                logging.info(f"Epoch {epoch:03d} | LR: {cur_lr:.2e} | Train Set IoU@{args.iou_threshold}: {tr_eval['iou']:.4f}")
                 tb.add_scalar("train/iou", tr_eval["iou"], epoch)
+
+            model.flow_net = flow_net
 
             if val_res["iou"] > best_iou:
                 best_iou = val_res["iou"]
@@ -371,15 +429,16 @@ def main():
                 torch.save(
                     {
                         "epoch": epoch,
+                        "lr": cur_lr,
                         "iou": best_iou,
                         "base_ch": args.base_ch,
                         "sam_vec_dim": sam_vec_dim,
-                        "model_state_dict": flow_net.state_dict(),
+                        "model_state_dict": ema_net.state_dict(),
                         "args": vars(args),
                     },
                     ckpt_path,
                 )
-                logging.info(f"Saved new best checkpoint (~35 MB): {ckpt_path}")
+                logging.info(f"Saved new best checkpoint (~35 MB, lr={cur_lr:.2e}): {ckpt_path}")
 
 
 if __name__ == "__main__":

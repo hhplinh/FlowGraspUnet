@@ -72,6 +72,8 @@ class RectifiedGraspFlow(nn.Module):
         target_v = x1 - x0
 
         # pred_v = self.flow_net(xt, t, img, inst_mask, sem_mask, sam_vec)
+        sam_vec = sam_vec.clone()
+        sam_vec[:, 4:8] = 0.0
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=img.is_cuda):
             pred_v = self.flow_net(xt, t, img, inst_mask, sem_mask, sam_vec)
         pred_v = pred_v.float()
@@ -148,6 +150,8 @@ class RectifiedGraspFlow(nn.Module):
             inst_mask, sem_mask, sam_vec = cached_sam
         else:
             inst_mask, sem_mask, sam_vec = self.sam_grounder(img, queries)
+        sam_vec = sam_vec.clone()
+        sam_vec[:, 4:8] = 0.0
 
         gen = None
         if seed is not None:
