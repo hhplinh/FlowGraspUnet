@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--sam3-path", type=str, default="/workspace/models/sam3")
     parser.add_argument("--base-ch", type=int, default=64, help="Base channel width of FlowGraspUNet")
     parser.add_argument("--input-size", type=int, default=224)
-    parser.add_argument("--num-steps", type=int, default=100, help="Euler ODE steps for validation")
+    parser.add_argument("--num-steps", type=int, default=16, help="Euler ODE steps for validation")
     parser.add_argument("--iou-threshold", type=float, default=0.25)
 
     # Dataset
@@ -51,7 +51,7 @@ def parse_args():
     # Training
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (16 * 2 = 32 effective bs)")
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--warmup-epochs", type=int, default=15)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -235,7 +235,7 @@ def train_one_epoch(
     sam_cache=None,
     grad_accum: int = 1,
     ema_net=None,
-    ema_decay: float = 0.9995,
+    ema_decay: float = 0.9998,
     opt_step: int = 0,
 ):
     model.flow_net.train()
